@@ -1,0 +1,95 @@
+import warnings
+
+import lightgbm as lgb
+import numpy as np
+import optuna
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold
+
+warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+protein_file = "UKB_Proteomics.csv"
+info_file = "Participants.csv"
+protein_list_file = "Organ-specific_proteins.xlsx"
+output_file = "Brain_Age_Gap.csv"
+
+df_protein = pd.read_csv(protein_file)
+df_info = pd.read_csv(info_file)
+df_protein_list = pd.read_excel(protein_list_file)
+df = pd.merge(df_info, df_protein, on="eid", how="inner")
+df = df.dropna(subset=["Age"]).reset_index(drop=True)
+
+protein_cols = df_protein_list["Brain"].dropna().tolist()
+protein_cols = [col for col in protein_cols if col in df.columns]
+if not protein_cols:
+    raise ValueError("No brain-enriched proteins are available in the input data.")
+
+X = df[protein_cols]
+y = df["Age"]
+
+def objective(trial):
+    params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "boosting_type": "gbdt",
+        "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.2, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbosity": -1,
+    }
+    scores = []
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    for train_idx, val_idx in cv.split(X):
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        pred = model.predict(X.iloc[val_idx])
+        observed = y.iloc[val_idx]
+        ss_res = np.sum((observed - pred) ** 2)
+        ss_tot = np.sum((observed - observed.mean()) ** 2)
+        scores.append(1 - ss_res / (ss_tot + 1e-8))
+    return float(np.mean(scores))
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=200, show_progress_bar=False)
+
+best_params = study.best_params
+best_params.update(
+    {
+        "objective": "regression",
+        "metric": "rmse",
+        "boosting_type": "gbdt",
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbosity": -1,
+    }
+)
+
+oof_age = np.zeros(len(df))
+cv = KFold(n_splits=5, shuffle=True, random_state=42)
+for train_idx, val_idx in cv.split(X):
+    model = lgb.LGBMRegressor(**best_params)
+    model.fit(X.iloc[train_idx], y.iloc[train_idx])
+    oof_age[val_idx] = model.predict(X.iloc[val_idx])
+
+age_regression = LinearRegression()
+age_regression.fit(df[["Age"]], oof_age)
+age_gap = oof_age - age_regression.predict(df[["Age"]])
+
+pd.DataFrame(
+    {
+        "eid": df["eid"],
+        "Age": df["Age"],
+        "Brain_Proteomic_Age": oof_age,
+        "Brain_Age_Gap": age_gap,
+    }
+).to_csv(output_file, index=False)
